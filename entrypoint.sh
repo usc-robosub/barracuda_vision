@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-source /opt/ros/noetic/setup.bash
+set -e
 
-cd barracuda-vision/catkin_ws
-catkin_make -DCMAKE_BUILD_TYPE=Release
-source devel/setup.bash
+source /opt/ros/humble/setup.bash
 
-roslaunch barracuda_vision barracuda_vision.launch --wait
+cd /opt/barracuda-vision/ros2_ws
+colcon build --symlink-install
+source install/setup.bash
+
+ros2 launch barracuda_vision barracuda_vision.launch.py

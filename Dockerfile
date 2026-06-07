@@ -1,21 +1,22 @@
-FROM ros:noetic-ros-base-focal
+FROM ros:humble-ros-base
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git vim wget \
     python3-pip \
+    python3-colcon-common-extensions \
     libopencv-dev \
     libx11-dev \
-    ros-noetic-cv-bridge \
-    ros-noetic-darknet-ros-msgs \
+    ros-humble-cv-bridge \
+    ros-humble-vision-msgs \
     python3-opencv \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN sudo pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN echo "source /opt/barracuda-vision/catkin_ws/devel/setup.bash" >> /root/.bashrc
+RUN echo "source /opt/barracuda-vision/ros2_ws/install/setup.bash" >> /root/.bashrc
 
 COPY . /opt/barracuda-vision
 WORKDIR /opt
-# Source the workspace on container start
+# Build and launch the workspace on container start
 CMD ["/bin/bash", "/opt/barracuda-vision/entrypoint.sh"]

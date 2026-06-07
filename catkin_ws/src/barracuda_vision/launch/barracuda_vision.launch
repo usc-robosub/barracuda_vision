@@ -1,5 +1,0 @@
-<launch>
-
-    <!-- Launch test.py script -->
-    <node name="barracuda_vision_listener" pkg="barracuda_vision" type="yolo_image_listener.py" output="screen"/>
-</launch>
