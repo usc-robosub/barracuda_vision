@@ -1,4 +1,14 @@
 .vscode
 
-catkin_ws/build
-catkin_ws/devel
+ros2_ws/build
+ros2_ws/install
+ros2_ws/log
+
+# Never commit model weights — they are mounted at runtime (see README).
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+localModels/
+models/
