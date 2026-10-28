@@ -59,7 +59,7 @@ from ultralytics.data.annotator import auto_annotate
 
 auto_annotate(
     data=str(image_dir),
-    det_model="yolov8x.pt",
+    det_model="/home/barracuda/ci_wt/main/models/best.pt",
     sam_model=SAM_MODEL,
     device="cuda:0",
     output_dir=str(label_dir),
