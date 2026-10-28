@@ -1,16 +1,34 @@
 #!/usr/bin/env python3
 """YOLO object-detection node for ROS 2.
 
-Subscribes to an image topic, runs a local Ultralytics YOLO model on each
-frame, and publishes the detection count, the bounding boxes as a
-vision_msgs/Detection2DArray, and an annotated image.
+Subscribes to an image topic and a depth topic, runs a local Ultralytics YOLO
+model on each RGB frame, and publishes the detection count, the bounding boxes
+as a vision_msgs/Detection2DArray (with robust median depth in position.z), and
+an annotated image.
+
+Improvement 1 – Mask-Based / Bbox Median Depth
+-----------------------------------------------
+Instead of reading a single center pixel (which lands on background water for
+thin pipes or hollow gates), we collect every finite, positive depth pixel
+inside the bounding box and return the **median**.  This is robust to:
+  * holes in disparity maps (stereo occlusion)
+  * specular reflections that saturate to inf/NaN
+  * thin pipes whose center pixel hits water behind them
+  * hollow gate frames whose interior is open water
+
+The depth result is written to Detection2D.results[0].pose.pose.position.z
+so downstream consumers (factor graph, behavior tree) can lift the 2D bbox to
+a 3D point without any other change.
 """
 
 import glob
 import os
+import threading
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
+from message_filters import ApproximateTimeSynchronizer, Subscriber
 
 from sensor_msgs.msg import Image
 from std_msgs.msg import Int32
@@ -26,13 +44,11 @@ import supervision as sv
 import torch
 
 
-def _set_bbox_center(bbox, cx, cy):
-    """Set a BoundingBox2D center, tolerant of vision_msgs API versions.
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    Older vision_msgs (<=4.0, geometry_msgs/Pose2D) exposes ``center.x``;
-    newer releases (vision_msgs/Pose2D with Point2D) expose
-    ``center.position.x``.
-    """
+def _set_bbox_center(bbox, cx, cy):
     center = bbox.center
     if hasattr(center, 'position'):
         center.position.x = cx
@@ -42,85 +58,116 @@ def _set_bbox_center(bbox, cx, cy):
         center.y = cy
 
 
+def sample_depth_bbox(depth_image: np.ndarray,
+                      xmin: int, ymin: int,
+                      xmax: int, ymax: int,
+                      min_valid: int = 5) -> float | None:
+    """Return the median depth (metres) of valid pixels inside a bounding box."""
+    h, w = depth_image.shape[:2]
+    x0 = max(0, int(xmin))
+    y0 = max(0, int(ymin))
+    x1 = min(w, int(xmax))
+    y1 = min(h, int(ymax))
+
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    roi = depth_image[y0:y1, x0:x1]
+    valid = roi[np.isfinite(roi) & (roi > 0.0)]
+
+    if len(valid) < min_valid:
+        return None
+
+    return float(np.median(valid))
+
+
+# ---------------------------------------------------------------------------
+# Node
+# ---------------------------------------------------------------------------
+
 class YoloImageListener(Node):
     def __init__(self):
         super().__init__('yolo_image_listener')
 
-        # Parameters
         self.declare_parameter('model_path', '')
         self.declare_parameter('model_dir', '/models')
         self.declare_parameter('input_topic', 'yolo_input_image')
+        self.declare_parameter('depth_topic', 'zed/depth/depth_registered')
+        self.declare_parameter('depth_sync_slop', 0.1)
+        self.declare_parameter('depth_min_valid_pixels', 5)
 
         model_path = self._resolve_model_path()
         self.get_logger().info(f'Using model file: {model_path}')
         self.model = YOLO(model_path)
 
         self.bridge = CvBridge()
+        self._depth_lock = threading.Lock()
+        self._latest_depth: np.ndarray | None = None
 
-        input_topic = self.get_parameter(
-            'input_topic').get_parameter_value().string_value
+        input_topic = self.get_parameter('input_topic').get_parameter_value().string_value
+        depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
+        depth_sync_slop = self.get_parameter('depth_sync_slop').get_parameter_value().double_value
 
-        self.sub = self.create_subscription(
-            Image, input_topic, self.infer, 10)
-        self.pub_object_detector = self.create_publisher(
-            Int32, 'object_detector', 10)
-        self.pub_detections = self.create_publisher(
-            Detection2DArray, 'detections', 10)
-        self.pub_detection_image = self.create_publisher(
-            Image, 'detection_image', 10)
+        rgb_sub = Subscriber(self, Image, input_topic)
+        depth_sub = Subscriber(self, Image, depth_topic)
+
+        self._sync = ApproximateTimeSynchronizer(
+            [rgb_sub, depth_sub],
+            queue_size=10,
+            slop=depth_sync_slop,
+        )
+        self._sync.registerCallback(self._synced_callback)
+
+        self.pub_object_detector = self.create_publisher(Int32, 'object_detector', 10)
+        self.pub_detections = self.create_publisher(Detection2DArray, 'detections', 10)
+        self.pub_detection_image = self.create_publisher(Image, 'detection_image', 10)
 
         self.get_logger().info(
-            f'yolo_image_listener ready, subscribed to "{input_topic}"')
+            f'yolo_image_listener ready — RGB: "{input_topic}", Depth: "{depth_topic}"')
 
     def _resolve_model_path(self):
-        """Return the model file to load.
-
-        Prefers the explicit ``model_path`` parameter; otherwise scans
-        ``model_dir`` and requires exactly one model file to be present.
-        """
-        model_path = self.get_parameter(
-            'model_path').get_parameter_value().string_value
+        model_path = self.get_parameter('model_path').get_parameter_value().string_value
         if model_path:
             if not os.path.isfile(model_path):
-                self.get_logger().fatal(
-                    f'model_path does not exist: {model_path}')
+                self.get_logger().fatal(f'model_path does not exist: {model_path}')
                 raise SystemExit(1)
             return model_path
 
-        models_dir = self.get_parameter(
-            'model_dir').get_parameter_value().string_value
-        model_files = [
-            f for f in glob.glob(os.path.join(models_dir, '*'))
-            if os.path.isfile(f)
-        ]
+        models_dir = self.get_parameter('model_dir').get_parameter_value().string_value
+        model_files = [f for f in glob.glob(os.path.join(models_dir, '*')) if os.path.isfile(f)]
         if not model_files:
-            self.get_logger().fatal(
-                f'No model file found in {models_dir}. Shutting down.')
+            self.get_logger().fatal(f'No model file found in {models_dir}. Shutting down.')
             raise SystemExit(1)
         if len(model_files) > 1:
             self.get_logger().fatal(
-                f'Multiple model files found in {models_dir}. '
-                'Only one model should be present. Shutting down.')
+                f'Multiple model files found in {models_dir}. Only one model should be present. Shutting down.')
             raise SystemExit(1)
         return model_files[0]
 
-    def infer(self, data):
-        """Run inference on an incoming image using the local model."""
-        image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
+    def _synced_callback(self, rgb_msg: Image, depth_msg: Image):
+        try:
+            depth_np = self.bridge.imgmsg_to_cv2(
+                depth_msg, desired_encoding='passthrough').astype(np.float32)
+        except Exception as e:
+            self.get_logger().warn(f'Failed to decode depth image: {e}')
+            depth_np = None
+
+        image = self.bridge.imgmsg_to_cv2(rgb_msg, 'bgr8')
         with torch.no_grad():
             outputs = self.model(image)
         result = outputs[0]
-        self.get_logger().info(
-            f'Local model inference: {len(result)} detections')
-        self.process_result(data, image, result)
 
-    def process_result(self, data, image, result):
-        """Convert results to ROS messages and publish them."""
+        self.get_logger().info(f'Local model inference: {len(result)} detections')
+        self.process_result(rgb_msg, image, result, depth_np)
+
+    def process_result(self, data, image, result, depth_np):
         detections = sv.Detections.from_ultralytics(result)
         xyxy = detections.xyxy
         confidence = detections.confidence
         class_id = detections.class_id
         names = getattr(result, 'names', {}) or {}
+
+        min_valid_px = self.get_parameter('depth_min_valid_pixels').get_parameter_value().integer_value
 
         det_array = Detection2DArray()
         det_array.header = data.header
@@ -130,8 +177,7 @@ class YoloImageListener(Node):
 
             det = Detection2D()
             det.header = data.header
-            _set_bbox_center(
-                det.bbox, (xmin + xmax) / 2.0, (ymin + ymax) / 2.0)
+            _set_bbox_center(det.bbox, (xmin + xmax) / 2.0, (ymin + ymax) / 2.0)
             det.bbox.size_x = xmax - xmin
             det.bbox.size_y = ymax - ymin
 
@@ -139,16 +185,26 @@ class YoloImageListener(Node):
             hyp = ObjectHypothesisWithPose()
             hyp.hypothesis.class_id = str(names.get(cid, cid))
             hyp.hypothesis.score = float(confidence[i])
-            det.results.append(hyp)
 
+            if depth_np is not None:
+                z = sample_depth_bbox(
+                    depth_np,
+                    int(xmin), int(ymin), int(xmax), int(ymax),
+                    min_valid=min_valid_px,
+                )
+                if z is not None:
+                    hyp.pose.pose.position.z = z
+                else:
+                    self.get_logger().warn(
+                        f'Detection {i} ({hyp.hypothesis.class_id}): '
+                        'not enough valid depth pixels in bbox — z left as 0')
+
+            det.results.append(hyp)
             det_array.detections.append(det)
 
-        # Annotate the frame for visualization.
         box_annotator = sv.BoxAnnotator()
-        annotated_frame = box_annotator.annotate(
-            scene=image.copy(), detections=detections)
-        detection_image = self.bridge.cv2_to_imgmsg(
-            annotated_frame, encoding='bgr8')
+        annotated_frame = box_annotator.annotate(scene=image.copy(), detections=detections)
+        detection_image = self.bridge.cv2_to_imgmsg(annotated_frame, encoding='bgr8')
         detection_image.header = data.header
 
         count = Int32()
