@@ -80,6 +80,67 @@ def sample_depth_bbox(depth_image: np.ndarray,
 
     return float(np.median(valid))
 
+def sample_depth_border(depth_image: np.ndarray,
+                        xmin: int, ymin: int,
+                        xmax: int, ymax: int,
+                        border: int = 8,
+                        min_valid: int = 5) -> float | None:
+    """Return median depth of pixels along the bbox border only.
+
+    Better than full-bbox median for hollow objects (gate) where the interior
+    is open water.  Samples a ring of `border` pixels wide around the edge.
+    """
+    h, w = depth_image.shape[:2]
+    x0 = max(0, int(xmin));  y0 = max(0, int(ymin))
+    x1 = min(w, int(xmax));  y1 = min(h, int(ymax))
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    roi = depth_image[y0:y1, x0:x1]
+    rh, rw = roi.shape[:2]
+    b = min(border, rh // 2, rw // 2)
+    if b < 1:
+        return sample_depth_bbox(depth_image, xmin, ymin, xmax, ymax, min_valid)
+
+    mask = np.zeros((rh, rw), dtype=bool)
+    mask[:b, :]  = True   # top strip
+    mask[-b:, :] = True   # bottom strip
+    mask[:, :b]  = True   # left strip
+    mask[:, -b:] = True   # right strip
+
+    border_px = roi[mask]
+    valid = border_px[np.isfinite(border_px) & (border_px > 0.0)]
+    if len(valid) < min_valid:
+        return None
+    return float(np.median(valid))
+
+
+def sample_depth_pipe(depth_image: np.ndarray,
+                      xmin: int, ymin: int,
+                      xmax: int, ymax: int,
+                      min_valid: int = 5) -> float | None:
+    """Return median depth for thin pipe objects.
+
+    Samples a narrow horizontal strip through the bbox centre rather than the
+    full bbox, reducing contamination from background water that bleeds through
+    a thin pipe.
+    """
+    h, w = depth_image.shape[:2]
+    x0 = max(0, int(xmin));  x1 = min(w, int(xmax))
+    cy = int((ymin + ymax) / 2)
+    strip_h = max(1, int((ymax - ymin) * 0.2))
+    y0 = max(0, cy - strip_h // 2)
+    y1 = min(h, cy + strip_h // 2 + 1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    roi = depth_image[y0:y1, x0:x1]
+    valid = roi[np.isfinite(roi) & (roi > 0.0)]
+    if len(valid) < min_valid:
+        return None
+    return float(np.median(valid))
+
+
 
 # ---------------------------------------------------------------------------
 # Node
@@ -187,11 +248,25 @@ class YoloImageListener(Node):
             hyp.hypothesis.score = float(confidence[i])
 
             if depth_np is not None:
-                z = sample_depth_bbox(
-                    depth_np,
-                    int(xmin), int(ymin), int(xmax), int(ymax),
-                    min_valid=min_valid_px,
-                )
+                class_name = hyp.hypothesis.class_id
+                if class_name == 'gate':
+                    z = sample_depth_border(
+                        depth_np,
+                        int(xmin), int(ymin), int(xmax), int(ymax),
+                        min_valid=min_valid_px,
+                    )
+                elif class_name in ('red_pipe', 'white_pipe'):
+                    z = sample_depth_pipe(
+                        depth_np,
+                        int(xmin), int(ymin), int(xmax), int(ymax),
+                        min_valid=min_valid_px,
+                    )
+                else:
+                    z = sample_depth_bbox(
+                        depth_np,
+                        int(xmin), int(ymin), int(xmax), int(ymax),
+                        min_valid=min_valid_px,
+                    )
                 if z is not None:
                     hyp.pose.pose.position.z = z
                 else:
