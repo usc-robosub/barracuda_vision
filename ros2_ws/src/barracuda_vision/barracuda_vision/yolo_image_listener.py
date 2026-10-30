@@ -26,11 +26,12 @@ import os
 import threading
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 import rclpy
 from rclpy.node import Node
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Int32
 from vision_msgs.msg import (
     Detection2D,
@@ -146,6 +147,63 @@ def sample_depth_pipe(depth_image: np.ndarray,
 # Node
 # ---------------------------------------------------------------------------
 
+
+def estimate_orientation(
+    depth_image: np.ndarray,
+    xmin: int, ymin: int,
+    xmax: int, ymax: int,
+    fx: float, fy: float,
+    cx: float, cy: float,
+    min_valid: int = 5,
+):
+    """Estimate object orientation by fitting a plane to 9 sample points.
+
+    Samples depth at 9 positions (4 corners, 4 edge midpoints, 1 centre),
+    projects each to 3D using camera intrinsics, fits a plane via SVD, and
+    returns the yaw angle (rotation about Y axis) as a quaternion [x,y,z,w].
+    Returns None if fewer than min_valid points have valid depth.
+    """
+    h, w = depth_image.shape[:2]
+    x0, x1 = max(0, int(xmin)), min(w - 1, int(xmax))
+    y0, y1 = max(0, int(ymin)), min(h - 1, int(ymax))
+    xm = (x0 + x1) // 2
+    ym = (y0 + y1) // 2
+
+    sample_uvs = [
+        (x0, y0), (xm, y0), (x1, y0),
+        (x0, ym), (xm, ym), (x1, ym),
+        (x0, y1), (xm, y1), (x1, y1),
+    ]
+
+    points = []
+    for u, v in sample_uvs:
+        z = float(depth_image[v, u])
+        if not (np.isfinite(z) and z > 0.0):
+            continue
+        X = (u - cx) * z / fx
+        Y = (v - cy) * z / fy
+        points.append([X, Y, z])
+
+    if len(points) < min_valid:
+        return None
+
+    pts = np.array(points)
+    centroid = pts.mean(axis=0)
+    _, _, Vt = np.linalg.svd(pts - centroid)
+    normal = Vt[-1]  # plane normal (smallest singular value)
+
+    # ensure normal points toward camera (positive Z component)
+    if normal[2] < 0:
+        normal = -normal
+
+    # yaw = rotation of normal projected onto XZ plane
+    yaw = float(np.arctan2(normal[0], normal[2]))
+
+    # convert yaw to quaternion [x, y, z, w]
+    r = Rotation.from_euler('y', yaw)
+    qx, qy, qz, qw = r.as_quat()
+    return float(qx), float(qy), float(qz), float(qw)
+
 class YoloImageListener(Node):
     def __init__(self):
         super().__init__('yolo_image_listener')
@@ -183,10 +241,29 @@ class YoloImageListener(Node):
         self.pub_detections = self.create_publisher(Detection2DArray, 'detections', 10)
         self.pub_detection_image = self.create_publisher(Image, 'detection_image', 10)
 
-        self.get_logger().info(
+        self._fx: float | None = None
+        self._fy: float | None = None
+        self._cx: float | None = None
+        self._cy: float | None = None
+        self._cam_info_lock = threading.Lock()
+        self.create_subscription(
+            CameraInfo,
+            'zed/rgb/camera_info',
+            self._camera_info_callback,
+            10,
+        )
+
+                self.get_logger().info(
             f'yolo_image_listener ready — RGB: "{input_topic}", Depth: "{depth_topic}"')
 
-    def _resolve_model_path(self):
+    def _camera_info_callback(self, msg: CameraInfo) -> None:
+        with self._cam_info_lock:
+            self._fx = msg.k[0]
+            self._fy = msg.k[4]
+            self._cx = msg.k[2]
+            self._cy = msg.k[5]
+
+        def _resolve_model_path(self):
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
         if model_path:
             if not os.path.isfile(model_path):
@@ -269,6 +346,24 @@ class YoloImageListener(Node):
                     )
                 if z is not None:
                     hyp.pose.pose.position.z = z
+
+                    # impr3: orientation estimation (gate only for now)
+                    if class_name == 'gate':
+                        with self._cam_info_lock:
+                            fx, fy, cx, cy = self._fx, self._fy, self._cx, self._cy
+                        if fx is not None:
+                            ori = estimate_orientation(
+                                depth_np,
+                                int(xmin), int(ymin), int(xmax), int(ymax),
+                                fx=fx, fy=fy, cx=cx, cy=cy,
+                                min_valid=min_valid_px,
+                            )
+                            if ori is not None:
+                                qx, qy, qz, qw = ori
+                                hyp.pose.pose.orientation.x = qx
+                                hyp.pose.pose.orientation.y = qy
+                                hyp.pose.pose.orientation.z = qz
+                                hyp.pose.pose.orientation.w = qw
                 else:
                     self.get_logger().warn(
                         f'Detection {i} ({hyp.hypothesis.class_id}): '
